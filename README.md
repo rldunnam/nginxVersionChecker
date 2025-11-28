@@ -5,8 +5,9 @@ A Python script that monitors the NGINX download page for new stable versions an
 ## Features
 
 - 🔍 Automatically checks for new NGINX stable versions
-- 📧 Email notifications via SMTP
-- 💬 Slack notifications via webhooks
+- 📧 Email notifications via SMTP (optional)
+- 💬 Slack notifications via webhooks (optional)
+- 💻 Console-only mode for simple version checking
 - 🔄 Automatic retry logic with exponential backoff
 - 🔐 Secure credential management via environment variables or .env files
 - 🧪 Dry-run mode for testing without sending notifications
@@ -107,6 +108,11 @@ DRY_RUN=false
 ## Usage
 
 ### Basic Usage
+
+**Run without notifications (console output only):**
+```bash
+python nginx_version_checker.py
+```
 
 **Enable email notifications:**
 ```bash
@@ -330,14 +336,19 @@ venv/
 
 ### Script exits with "Configuration validation failed"
 
-**Problem:** Required credentials are missing.
+**Problem:** Required credentials are missing for enabled notification methods.
 
-**Solution:** Ensure you've either:
-- Set environment variables, OR
-- Created a `.env` file with required values, OR
-- Provided credentials via command-line arguments
-
-AND enabled at least one notification method with `--enable-email` or `--enable-slack`.
+**Solution:** 
+- If you want console-only output, just run the script without any flags:
+  ```bash
+  python nginx_version_checker.py
+  ```
+- If you want notifications, ensure you've either:
+  - Set environment variables, OR
+  - Created a `.env` file with required values, OR
+  - Provided credentials via command-line arguments
+  
+  AND enabled at least one notification method with `--enable-email` or `--enable-slack`.
 
 ### Email authentication fails
 
