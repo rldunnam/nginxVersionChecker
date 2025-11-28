@@ -1,80 +1,496 @@
 #!/usr/bin/env python3
 """
-Check nginx download page for newest version and alert each time a new version is available
+NGINX Version Checker
+
+Monitors the NGINX download page for new stable versions and sends
+notifications via email and/or Slack when a new version is detected.
+
+Configuration:
+    Set environment variables or create a .env file:
+    - SMTP_SERVER (default: smtp.office365.com)
+    - SMTP_PORT (default: 587)
+    - EMAIL_USERNAME (required if email enabled)
+    - EMAIL_PASSWORD (required if email enabled)
+    - EMAIL_FROM (required if email enabled)
+    - EMAIL_TO (required if email enabled)
+    - SLACK_WEBHOOK_URL (required if Slack enabled)
+    - VERSION_FILE (default: nginx_last_version.txt)
+    - ENABLE_EMAIL (default: false)
+    - ENABLE_SLACK (default: false)
+    - DRY_RUN (default: false)
+
+Usage:
+    python nginx_version_checker.py [--enable-email] [--enable-slack] [--dry-run] [--verbose]
 """
-import requests
+
 import os
-from bs4 import BeautifulSoup
 import re
+import sys
+import smtplib
+import logging
+import argparse
+import time
+import requests
+from typing import Optional
+from bs4 import BeautifulSoup
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-NGINX_DOWNLOAD_PAGE = "https://nginx.org/en/download.html"
-VERSION_FILE = "nginx_last_version.txt"
-SLACK_WEBHOOK_URL = 'https://hooks.slack.com/services/T5B327YJ0/<YOUR-WEBHOOK-TOKEN>'
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip .env file loading
 
-def get_latest_stable_version():
-    response = requests.get(NGINX_DOWNLOAD_PAGE)
-    response.raise_for_status()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+# Constants
+URL = 'https://nginx.org/en/download.html'
+VERSION_PATTERN = r"nginx-(\d+\.\d+\.\d+)"
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
-    # Find the "Stable version" heading
-    stable_header = soup.find("h4", string="Stable version")
-    if not stable_header:
-        raise ValueError("Stable version heading not found.")
 
-    # Find the first <a> tag after the heading that links to a .tar.gz file with version
-    table = stable_header.find_next("table")
-    if not table:
-        raise ValueError("Could not find stable version table.")
+class ConfigError(Exception):
+    """Raised when configuration is invalid or missing"""
+    pass
 
-    # Look for a link that matches the version pattern
-    link = table.find("a", href=re.compile(r"nginx-(\d+\.\d+\.\d+)\.tar\.gz"))
-    if not link:
-        raise ValueError("Could not find version link in stable version table.")
 
-    # Extract version from link text
-    match = re.search(r"nginx-(\d+\.\d+\.\d+)", link.text)
-    if not match:
-        raise ValueError("Version pattern not found in link text.")
+class Config:
+    """Configuration manager with validation"""
+    
+    def __init__(self, args):
+        """
+        Initialize configuration from args, environment variables, and defaults
+        
+        Args:
+            args: Parsed command-line arguments from argparse
+        """
+        # SMTP configuration
+        self.smtp_server = args.smtp_server or os.getenv('SMTP_SERVER', 'smtp.office365.com')
+        self.smtp_port = args.smtp_port or int(os.getenv('SMTP_PORT', '587'))
+        
+        # Email configuration
+        self.email_username = args.email_username or os.getenv('EMAIL_USERNAME')
+        self.email_password = args.email_password or os.getenv('EMAIL_PASSWORD')
+        self.email_from = args.email_from or os.getenv('EMAIL_FROM')
+        self.email_to = args.email_to or os.getenv('EMAIL_TO')
+        
+        # Slack configuration
+        self.slack_webhook_url = args.slack_webhook or os.getenv('SLACK_WEBHOOK_URL')
+        
+        # File configuration
+        self.version_file = args.version_file or os.getenv('VERSION_FILE', 'nginx_last_version.txt')
+        
+        # Feature flags - command line args take precedence
+        if args.enable_email:
+            self.enable_email = True
+        elif args.disable_email:
+            self.enable_email = False
+        else:
+            self.enable_email = os.getenv('ENABLE_EMAIL', 'false').lower() == 'true'
+        
+        if args.enable_slack:
+            self.enable_slack = True
+        elif args.disable_slack:
+            self.enable_slack = False
+        else:
+            self.enable_slack = os.getenv('ENABLE_SLACK', 'false').lower() == 'true'
+        
+        self.dry_run = args.dry_run or os.getenv('DRY_RUN', 'false').lower() == 'true'
+    
+    def validate(self):
+        """Validate configuration and raise ConfigError if invalid"""
+        errors = []
+        
+        if self.enable_email:
+            if not self.email_username:
+                errors.append("EMAIL_USERNAME is required when email is enabled")
+            if not self.email_password:
+                errors.append("EMAIL_PASSWORD is required when email is enabled")
+            if not self.email_from:
+                errors.append("EMAIL_FROM is required when email is enabled")
+            if not self.email_to:
+                errors.append("EMAIL_TO is required when email is enabled")
+        
+        if self.enable_slack:
+            if not self.slack_webhook_url:
+                errors.append("SLACK_WEBHOOK_URL is required when Slack is enabled")
+            elif not self.slack_webhook_url.startswith('https://hooks.slack.com/'):
+                errors.append("SLACK_WEBHOOK_URL appears to be invalid")
+        
+        if not self.enable_email and not self.enable_slack:
+            errors.append("At least one notification method must be enabled. Use --enable-email or --enable-slack")
+        
+        if errors:
+            raise ConfigError("Configuration validation failed:\n  - " + "\n  - ".join(errors))
+        
+        logger.info("Configuration validated successfully")
+        logger.info(f"Email notifications: {'enabled' if self.enable_email else 'disabled'}")
+        logger.info(f"Slack notifications: {'enabled' if self.enable_slack else 'disabled'}")
 
-    return match.group(1)
 
-def read_stored_version():
-    if not os.path.exists(VERSION_FILE):
+def sanitize_version(version: str) -> str:
+    """Sanitize version string to prevent injection attacks"""
+    # Only allow digits and dots
+    sanitized = re.sub(r'[^\d.]', '', version)
+    if sanitized != version:
+        logger.warning(f"Version string sanitized: '{version}' -> '{sanitized}'")
+    return sanitized
+
+
+def get_latest_version(retry_count: int = 0) -> Optional[str]:
+    """
+    Fetch the latest stable NGINX version from the download page
+    
+    Args:
+        retry_count: Current retry attempt number
+        
+    Returns:
+        Latest version string or None if not found
+    """
+    try:
+        logger.info(f"Fetching page from {URL}")
+        response = requests.get(
+            URL,
+            timeout=REQUEST_TIMEOUT,
+            headers={'User-Agent': 'NGINX-Version-Checker/2.0'}
+        )
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Find the "Stable version" heading
+        stable_header = soup.find("h4", string="Stable version")
+        if not stable_header:
+            logger.error("Stable version heading not found on page")
+            return None
+        
+        # Find the table after the heading
+        table = stable_header.find_next("table")
+        if not table:
+            logger.error("Could not find stable version table")
+            return None
+        
+        # Look for a link matching the version pattern
+        link = table.find("a", href=re.compile(VERSION_PATTERN))
+        if not link:
+            logger.error("Could not find version link in stable version table")
+            return None
+        
+        # Extract version from link text
+        match = re.search(VERSION_PATTERN, link.text)
+        if not match:
+            logger.error("Version pattern not found in link text")
+            return None
+        
+        latest_version = match.group(1)
+        sanitized = sanitize_version(latest_version)
+        logger.info(f"Found latest stable version: {sanitized}")
+        return sanitized
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"Request timed out after {REQUEST_TIMEOUT} seconds")
+        if retry_count < MAX_RETRIES:
+            logger.info(f"Retrying in {RETRY_DELAY} seconds... (attempt {retry_count + 1}/{MAX_RETRIES})")
+            time.sleep(RETRY_DELAY)
+            return get_latest_version(retry_count + 1)
+        logger.error("Max retries reached")
         return None
-    with open(VERSION_FILE, "r") as f:
-        return f.read().strip()
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching page: {e}")
+        if retry_count < MAX_RETRIES:
+            logger.info(f"Retrying in {RETRY_DELAY} seconds... (attempt {retry_count + 1}/{MAX_RETRIES})")
+            time.sleep(RETRY_DELAY)
+            return get_latest_version(retry_count + 1)
+        logger.error("Max retries reached")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return None
 
-def write_stored_version(version):
-    with open(VERSION_FILE, "w") as f:
-        f.write(version)
 
-def notify_console(version):
-    print(f"[!] New stable NGINX version available: {version}")
+def read_last_version(version_file: str) -> Optional[str]:
+    """Read the last known version from file"""
+    try:
+        with open(version_file, 'r') as f:
+            version = f.read().strip()
+            logger.debug(f"Read last version: {version}")
+            return version
+    except FileNotFoundError:
+        logger.info("No previous version file found - this appears to be the first run")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading version file: {e}")
+        return None
 
-def notify_slack(version):
-    message = {
-        "text": f":tada: A new **stable** NGINX version is available: *{version}*. Check it out here: {NGINX_DOWNLOAD_PAGE}"
+
+def write_last_version(version: str, version_file: str) -> bool:
+    """Write the current version to file"""
+    try:
+        with open(version_file, 'w') as f:
+            f.write(version)
+        logger.debug(f"Wrote version {version} to file")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing version file: {e}")
+        return False
+
+
+def send_email_notification(config: Config, version: str) -> bool:
+    """
+    Send email notification about new version
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if config.dry_run:
+        logger.info(f"[DRY RUN] Would send email to {config.email_to}")
+        return True
+    
+    msg = MIMEMultipart()
+    msg['From'] = config.email_from
+    msg['To'] = config.email_to
+    msg['Subject'] = f"New NGINX Stable Version Detected: {version}"
+    
+    body = f"""A new stable version of NGINX has been released.
+
+Version: {version}
+Download Page: {URL}
+
+This is an automated notification from the NGINX Version Checker.
+"""
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        logger.info("Sending email notification...")
+        with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=30) as server:
+            server.starttls()
+            server.login(config.email_username, config.email_password)
+            server.sendmail(config.email_from, config.email_to, msg.as_string())
+        logger.info("Email notification sent successfully")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        logger.error("Email authentication failed - check EMAIL_USERNAME and EMAIL_PASSWORD")
+        return False
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending email: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error sending email: {e}")
+        return False
+
+
+def send_slack_notification(config: Config, version: str) -> bool:
+    """
+    Send Slack notification about new version
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if config.dry_run:
+        logger.info("[DRY RUN] Would send Slack notification")
+        return True
+    
+    payload = {
+        "text": f":tada: A new stable NGINX version is available: *{version}*\nCheck it out here: {URL}"
     }
-    response = requests.post(SLACK_WEBHOOK_URL, json=message)
-    if response.status_code != 200:
-        print(f"[!] Slack notification failed: {response.status_code}, {response.text}")
+    
+    try:
+        logger.info("Sending Slack notification...")
+        response = requests.post(
+            config.slack_webhook_url,
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            logger.info("Slack notification sent successfully")
+            return True
+        else:
+            logger.error(f"Slack API returned status {response.status_code}: {response.text}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending Slack notification: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error sending Slack notification: {e}")
+        return False
+
+
+def notify_new_version(config: Config, version: str) -> bool:
+    """
+    Send all configured notifications
+    
+    Returns:
+        True if at least one notification succeeded
+    """
+    logger.info(f"New stable NGINX version detected: {version}")
+    
+    success = False
+    
+    if config.enable_email:
+        if send_email_notification(config, version):
+            success = True
+    
+    if config.enable_slack:
+        if send_slack_notification(config, version):
+            success = True
+    
+    return success
+
 
 def main():
+    """Main execution function"""
+    parser = argparse.ArgumentParser(
+        description='Monitor NGINX for new stable versions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Enable email notifications via command line
+  %(prog)s --enable-email --email-username user@example.com --email-password secret
+  
+  # Enable both email and Slack
+  %(prog)s --enable-email --enable-slack
+  
+  # Test without sending notifications
+  %(prog)s --dry-run --enable-email --enable-slack
+  
+  # Use environment variables (set EMAIL_USERNAME, etc. first)
+  %(prog)s --enable-email
+        """
+    )
+    
+    # Notification control
+    parser.add_argument(
+        '--enable-email',
+        action='store_true',
+        help='Enable email notifications (default: disabled)'
+    )
+    parser.add_argument(
+        '--enable-slack',
+        action='store_true',
+        help='Enable Slack notifications (default: disabled)'
+    )
+    parser.add_argument(
+        '--disable-email',
+        action='store_true',
+        help='Explicitly disable email notifications'
+    )
+    parser.add_argument(
+        '--disable-slack',
+        action='store_true',
+        help='Explicitly disable Slack notifications'
+    )
+    
+    # SMTP configuration
+    parser.add_argument(
+        '--smtp-server',
+        help='SMTP server hostname (default: smtp.office365.com)'
+    )
+    parser.add_argument(
+        '--smtp-port',
+        type=int,
+        help='SMTP server port (default: 587)'
+    )
+    
+    # Email configuration
+    parser.add_argument(
+        '--email-username',
+        help='Email account username'
+    )
+    parser.add_argument(
+        '--email-password',
+        help='Email account password'
+    )
+    parser.add_argument(
+        '--email-from',
+        help='From email address'
+    )
+    parser.add_argument(
+        '--email-to',
+        help='To email address'
+    )
+    
+    # Slack configuration
+    parser.add_argument(
+        '--slack-webhook',
+        help='Slack webhook URL'
+    )
+    
+    # Other options
+    parser.add_argument(
+        '--version-file',
+        help='Path to version tracking file (default: nginx_last_version.txt)'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Run without sending notifications'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Load and validate configuration
     try:
-        latest = get_latest_stable_version()
-        stored = read_stored_version()
-
-        if latest != stored:
-            notify_console(latest)
-            notify_slack(latest)
-            write_stored_version(latest)
+        config = Config(args)
+        if args.dry_run:
+            logger.info("Running in DRY RUN mode - no notifications will be sent")
+        config.validate()
+    except ConfigError as e:
+        logger.error(str(e))
+        logger.error("\nPlease provide configuration via:")
+        logger.error("  1. Command-line arguments (see --help)")
+        logger.error("  2. Environment variables")
+        logger.error("  3. .env file (requires: pip install python-dotenv)")
+        sys.exit(1)
+    
+    # Get latest version
+    latest_version = get_latest_version()
+    if not latest_version:
+        logger.error("Failed to retrieve version information")
+        sys.exit(1)
+    
+    # Check if version has changed
+    last_version = read_last_version(config.version_file)
+    
+    if last_version is None:
+        logger.info(f"First run - recording current version: {latest_version}")
+        write_last_version(latest_version, config.version_file)
+        sys.exit(0)
+    
+    if last_version != latest_version:
+        logger.info(f"Version changed: {last_version} -> {latest_version}")
+        
+        if notify_new_version(config, latest_version):
+            logger.info("Notifications sent successfully")
+            write_last_version(latest_version, config.version_file)
+            sys.exit(0)
         else:
-            print(f"[✓] No new version. Latest is still {latest}")
+            logger.error("All notification attempts failed")
+            sys.exit(1)
+    else:
+        logger.info(f"No new version detected. Current stable version: {latest_version}")
+        sys.exit(0)
 
-    except Exception as e:
-        print(f"[✗] Error checking NGINX version: {e}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
