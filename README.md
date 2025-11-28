@@ -14,12 +14,12 @@ A Python script that monitors the NGINX download page for new stable versions an
 - ⚙️ Flexible configuration via command-line arguments, environment variables, or .env files
 - 🛡️ Input sanitization and security best practices
 - 🎯 Focuses specifically on stable releases (not mainline)
+- ⚡ Lightweight - no heavy parsing libraries required
 
 ## Requirements
 
 - Python 3.6+
 - `requests` library
-- `beautifulsoup4` library
 - `python-dotenv` (optional, for .env file support)
 
 ## Installation
@@ -32,7 +32,7 @@ A Python script that monitors the NGINX download page for new stable versions an
 
 2. **Install required dependencies**
    ```bash
-   pip install requests beautifulsoup4
+   pip install requests
    
    # Optional: for .env file support
    pip install python-dotenv
@@ -235,12 +235,24 @@ chmod 600 ~/.nginx_credentials
 ## How It Works
 
 1. **Fetches** the NGINX download page (https://nginx.org/en/download.html)
-2. **Parses** the HTML to locate the "Stable version" section using BeautifulSoup
+2. **Parses** the HTML using regex to locate the "Stable version" section
 3. **Extracts** the latest stable version number from download links
 4. **Compares** with the last known version stored in a local file
 5. **Notifies** via configured channels (email/Slack) if a new stable version is detected
 6. **Updates** the version tracking file with the new version
 7. **Retries** automatically on transient failures (up to 3 attempts)
+
+### Parsing Strategy
+
+The script uses a targeted regex pattern to find stable versions:
+```python
+STABLE_VERSION_PATTERN = r'<h4>Stable version</h4>.*?nginx-(\d+\.\d+\.\d+)\.tar\.gz'
+```
+
+This pattern:
+- Locates the "Stable version" heading
+- Finds the first version number in that section
+- Ignores mainline versions (different section on the page)
 
 ### First Run Behavior
 
@@ -254,7 +266,7 @@ Subsequent runs will compare against this stored version.
 ### Stable vs Mainline
 
 This script specifically monitors **stable versions only**. NGINX releases two branches:
-- **Stable** - Production-ready, recommended for most users
+- **Stable** - Production-ready, recommended for most users (what this script monitors)
 - **Mainline** - Latest features, may be less stable
 
 The script focuses on stable releases as they are the recommended choice for production environments.
@@ -359,23 +371,23 @@ AND enabled at least one notification method with `--enable-email` or `--enable-
 
 ### No version found or parsing error
 
-**Problem:** `Stable version heading not found` or `Could not find version link`
+**Problem:** `Stable version pattern not found in page content`
 
 **Solutions:**
 - Check if the NGINX download page is accessible
 - Verify internet connectivity
 - Check if page structure changed (NGINX may have updated their site)
-- Install/update BeautifulSoup: `pip install --upgrade beautifulsoup4`
-- Try with `--verbose` flag to see detailed parsing information
+- Try with `--verbose` flag to see what content is being fetched
+- If NGINX changes their page structure, the regex pattern may need updating
 
-### BeautifulSoup not installed
+### Regex pattern needs updating
 
-**Problem:** `ModuleNotFoundError: No module named 'bs4'`
-
-**Solution:**
-```bash
-pip install beautifulsoup4
+If NGINX changes their download page structure, you may need to update the pattern. The current pattern is:
+```python
+STABLE_VERSION_PATTERN = r'<h4>Stable version</h4>.*?nginx-(\d+\.\d+\.\d+)\.tar\.gz'
 ```
+
+You can test the pattern against the live page by running with `--verbose` to see the HTML content being parsed.
 
 ## Exit Codes
 
@@ -465,7 +477,7 @@ Check for new NGINX versions before deploying:
 # .gitlab-ci.yml example
 check-nginx-version:
   script:
-    - pip install requests beautifulsoup4
+    - pip install requests python-dotenv
     - python nginx_version_checker.py --enable-slack --slack-webhook $SLACK_WEBHOOK
   only:
     - schedules
@@ -496,6 +508,7 @@ NGINX uses a three-part version number: `MAJOR.MINOR.PATCH`
 
 If you need to monitor other software versions, check out our related tools:
 - [Sonatype IQ Server Version Checker](../sonatype-version-checker/)
+- [Elasticsearch Version Checker](../elasticsearch-version-checker/)
 - [Docker Version Checker](../docker-version-checker/)
 - [Node.js Version Checker](../nodejs-version-checker/)
 
@@ -521,6 +534,13 @@ For issues, questions, or feature requests, please:
 
 ## Changelog
 
+### Version 2.1
+- Removed BeautifulSoup dependency for consistency with other checkers
+- Simplified HTML parsing using regex
+- Reduced dependencies to just `requests` and `python-dotenv`
+- Improved parsing reliability with targeted regex pattern
+- Updated documentation to reflect simplified dependencies
+
 ### Version 2.0
 - Complete refactor with modern Python practices
 - Added command-line argument support for all configuration options
@@ -542,4 +562,4 @@ For issues, questions, or feature requests, please:
 ## Acknowledgments
 
 - NGINX team for maintaining clear version information on their download page
-- BeautifulSoup library for HTML parsing capabilities
+- The open-source community for Python libraries used in this project

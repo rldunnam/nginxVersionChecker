@@ -32,7 +32,6 @@ import argparse
 import time
 import requests
 from typing import Optional
-from bs4 import BeautifulSoup
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -52,7 +51,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 URL = 'https://nginx.org/en/download.html'
-VERSION_PATTERN = r"nginx-(\d+\.\d+\.\d+)"
+# Pattern to find stable version section and extract version number
+STABLE_VERSION_PATTERN = r'<h4>Stable version</h4>.*?nginx-(\d+\.\d+\.\d+)\.tar\.gz'
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -165,30 +165,11 @@ def get_latest_version(retry_count: int = 0) -> Optional[str]:
         )
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Find the "Stable version" heading
-        stable_header = soup.find("h4", string="Stable version")
-        if not stable_header:
-            logger.error("Stable version heading not found on page")
-            return None
-        
-        # Find the table after the heading
-        table = stable_header.find_next("table")
-        if not table:
-            logger.error("Could not find stable version table")
-            return None
-        
-        # Look for a link matching the version pattern
-        link = table.find("a", href=re.compile(VERSION_PATTERN))
-        if not link:
-            logger.error("Could not find version link in stable version table")
-            return None
-        
-        # Extract version from link text
-        match = re.search(VERSION_PATTERN, link.text)
+        # Search for stable version pattern in HTML
+        # This pattern finds the "Stable version" section and extracts the version number
+        match = re.search(STABLE_VERSION_PATTERN, response.text, re.DOTALL)
         if not match:
-            logger.error("Version pattern not found in link text")
+            logger.error("Stable version pattern not found in page content")
             return None
         
         latest_version = match.group(1)
