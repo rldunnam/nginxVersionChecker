@@ -3,7 +3,7 @@
 NGINX Version Checker
 
 Monitors the NGINX download page for new stable versions and sends
-notifications via email and/or Slack when a new version is detected.
+notifications via email, Slack, and/or Microsoft Teams when a new version is detected.
 
 Configuration:
     Set environment variables or create a .env file:
@@ -14,18 +14,21 @@ Configuration:
     - EMAIL_FROM (required if email enabled)
     - EMAIL_TO (required if email enabled)
     - SLACK_WEBHOOK_URL (required if Slack enabled)
+    - TEAMS_WEBHOOK_URL (required if Teams enabled)
     - VERSION_FILE (default: nginx_last_version.txt)
     - ENABLE_EMAIL (default: false)
     - ENABLE_SLACK (default: false)
+    - ENABLE_TEAMS (default: false)
     - DRY_RUN (default: false)
 
 Usage:
-    python nginx_version_checker.py [--enable-email] [--enable-slack] [--dry-run] [--verbose]
+    python nginx_version_checker.py [--enable-email] [--enable-slack] [--enable-teams] [--dry-run] [--verbose]
 """
 
 import os
 import re
 import sys
+import json
 import smtplib
 import logging
 import argparse
@@ -86,6 +89,9 @@ class Config:
         # Slack configuration
         self.slack_webhook_url = args.slack_webhook or os.getenv('SLACK_WEBHOOK_URL')
         
+        # Teams configuration
+        self.teams_webhook_url = args.teams_webhook or os.getenv('TEAMS_WEBHOOK_URL')
+        
         # File configuration
         self.version_file = args.version_file or os.getenv('VERSION_FILE', 'nginx_last_version.txt')
         
@@ -103,6 +109,13 @@ class Config:
             self.enable_slack = False
         else:
             self.enable_slack = os.getenv('ENABLE_SLACK', 'false').lower() == 'true'
+        
+        if args.enable_teams:
+            self.enable_teams = True
+        elif args.disable_teams:
+            self.enable_teams = False
+        else:
+            self.enable_teams = os.getenv('ENABLE_TEAMS', 'false').lower() == 'true'
         
         self.dry_run = args.dry_run or os.getenv('DRY_RUN', 'false').lower() == 'true'
     
@@ -126,14 +139,27 @@ class Config:
             elif not self.slack_webhook_url.startswith('https://hooks.slack.com/'):
                 errors.append("SLACK_WEBHOOK_URL appears to be invalid")
         
+        if self.enable_teams:
+            if not self.teams_webhook_url:
+                errors.append("TEAMS_WEBHOOK_URL is required when Teams is enabled")
+            elif not self.teams_webhook_url.startswith('https://'):
+                errors.append("TEAMS_WEBHOOK_URL must start with https://")
+            elif not (
+                'webhook.office.com' in self.teams_webhook_url or 
+                'powerplatform.com' in self.teams_webhook_url or
+                'logic.azure.com' in self.teams_webhook_url
+            ):
+                errors.append("TEAMS_WEBHOOK_URL appears to be invalid (should be a Teams webhook or Power Automate flow URL)")
+        
         if errors:
             raise ConfigError("Configuration validation failed:\n  - " + "\n  - ".join(errors))
         
         logger.info("Configuration validated successfully")
         logger.info(f"Email notifications: {'enabled' if self.enable_email else 'disabled'}")
         logger.info(f"Slack notifications: {'enabled' if self.enable_slack else 'disabled'}")
+        logger.info(f"Teams notifications: {'enabled' if self.enable_teams else 'disabled'}")
         
-        if not self.enable_email and not self.enable_slack:
+        if not self.enable_email and not self.enable_slack and not self.enable_teams:
             logger.info("Running in console-only mode (no notifications will be sent)")
 
 
@@ -309,17 +335,143 @@ def send_slack_notification(config: Config, version: str) -> bool:
         return False
 
 
+def send_teams_notification(config: Config, version: str) -> bool:
+    """
+    Send Microsoft Teams notification about new version
+    
+    Supports both:
+    - Traditional Teams Incoming Webhooks (webhook.office.com)
+    - Power Automate Flow webhooks (powerplatform.com)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if config.dry_run:
+        logger.info("[DRY RUN] Would send Teams notification")
+        return True
+    
+    # Determine if this is a Power Automate webhook or traditional Teams webhook
+    is_power_automate = 'powerplatform.com' in config.teams_webhook_url or 'logic.azure.com' in config.teams_webhook_url
+    
+    logger.debug(f"Teams webhook type: {'Power Automate' if is_power_automate else 'Traditional'}")
+    logger.debug(f"Webhook URL (first 50 chars): {config.teams_webhook_url[:50]}...")
+    
+    if is_power_automate:
+        # Power Automate expects simple JSON payload
+        payload = {
+            "title": "New NGINX Version Available",
+            "version": version,
+            "status": "Stable Release",
+            "description": f"A new stable version of NGINX has been released: {version}",
+            "url": URL,
+            "emoji": "🎉"
+        }
+        logger.debug("Using Power Automate payload format")
+    else:
+        # Traditional Teams webhook uses Adaptive Card format
+        payload = {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "contentUrl": None,
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "version": "1.4",
+                        "body": [
+                            {
+                                "type": "TextBlock",
+                                "size": "Large",
+                                "weight": "Bolder",
+                                "text": "🎉 New NGINX Version Available",
+                                "wrap": True,
+                                "color": "Good"
+                            },
+                            {
+                                "type": "FactSet",
+                                "facts": [
+                                    {
+                                        "title": "Version:",
+                                        "value": version
+                                    },
+                                    {
+                                        "title": "Status:",
+                                        "value": "Stable Release"
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "TextBlock",
+                                "text": "A new stable version of NGINX has been released and is ready for download.",
+                                "wrap": True
+                            }
+                        ],
+                        "actions": [
+                            {
+                                "type": "Action.OpenUrl",
+                                "title": "View Download Page",
+                                "url": URL
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        logger.debug("Using Traditional Teams Adaptive Card format")
+    
+    logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+    
+    try:
+        logger.info("Sending Teams notification...")
+        logger.debug(f"POST request to: {config.teams_webhook_url[:80]}...")
+        
+        response = requests.post(
+            config.teams_webhook_url,
+            json=payload,
+            timeout=10,
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        logger.debug(f"Response status code: {response.status_code}")
+        logger.debug(f"Response headers: {dict(response.headers)}")
+        logger.debug(f"Response body: {response.text}")
+        
+        # Power Automate returns 202 Accepted, traditional webhooks return 200
+        if response.status_code in (200, 202):
+            logger.info("Teams notification sent successfully")
+            return True
+        else:
+            logger.error(f"Teams API returned status {response.status_code}: {response.text}")
+            return False
+            
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Teams notification request timed out: {e}")
+        return False
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error sending Teams notification: {e}")
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending Teams notification: {e}")
+        logger.debug(f"Full error details: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error sending Teams notification: {e}")
+        logger.debug(f"Full error details: {e}", exc_info=True)
+        return False
+
+
 def notify_new_version(config: Config, version: str) -> bool:
     """
     Send all configured notifications
     
     Returns:
-        True if notifications sent or none configured, False if all notifications failed
+        True if at least one notification sent or none configured, False if all notifications failed
     """
     logger.info(f"New stable NGINX version detected: {version}")
     
     # If no notifications are configured, just log and return success
-    if not config.enable_email and not config.enable_slack:
+    if not config.enable_email and not config.enable_slack and not config.enable_teams:
         logger.info("No notifications configured - version detection logged to console only")
         return True
     
@@ -331,6 +483,10 @@ def notify_new_version(config: Config, version: str) -> bool:
     
     if config.enable_slack:
         if send_slack_notification(config, version):
+            success = True
+    
+    if config.enable_teams:
+        if send_teams_notification(config, version):
             success = True
     
     return success
@@ -346,14 +502,17 @@ Examples:
   # Enable email notifications via command line
   %(prog)s --enable-email --email-username user@example.com --email-password secret
   
-  # Enable both email and Slack
-  %(prog)s --enable-email --enable-slack
+  # Enable email, Slack, and Teams
+  %(prog)s --enable-email --enable-slack --enable-teams
+  
+  # Enable only Teams notifications
+  %(prog)s --enable-teams --teams-webhook https://your-org.webhook.office.com/...
   
   # Test without sending notifications
-  %(prog)s --dry-run --enable-email --enable-slack
+  %(prog)s --dry-run --enable-email --enable-slack --enable-teams
   
-  # Use environment variables (set EMAIL_USERNAME, etc. first)
-  %(prog)s --enable-email
+  # Use environment variables (set EMAIL_USERNAME, TEAMS_WEBHOOK_URL, etc. first)
+  %(prog)s --enable-email --enable-teams
         """
     )
     
@@ -369,6 +528,11 @@ Examples:
         help='Enable Slack notifications (default: disabled)'
     )
     parser.add_argument(
+        '--enable-teams',
+        action='store_true',
+        help='Enable Microsoft Teams notifications (default: disabled)'
+    )
+    parser.add_argument(
         '--disable-email',
         action='store_true',
         help='Explicitly disable email notifications'
@@ -377,6 +541,11 @@ Examples:
         '--disable-slack',
         action='store_true',
         help='Explicitly disable Slack notifications'
+    )
+    parser.add_argument(
+        '--disable-teams',
+        action='store_true',
+        help='Explicitly disable Teams notifications'
     )
     
     # SMTP configuration
@@ -414,6 +583,12 @@ Examples:
         help='Slack webhook URL'
     )
     
+    # Teams configuration
+    parser.add_argument(
+        '--teams-webhook',
+        help='Microsoft Teams webhook URL'
+    )
+    
     # Other options
     parser.add_argument(
         '--version-file',
@@ -423,6 +598,11 @@ Examples:
         '--dry-run',
         action='store_true',
         help='Run without sending notifications'
+    )
+    parser.add_argument(
+        '--force-notify',
+        action='store_true',
+        help='Force notification even if version unchanged (for testing)'
     )
     parser.add_argument(
         '--verbose',
@@ -475,6 +655,17 @@ Examples:
             sys.exit(1)
     else:
         logger.info(f"No new version detected. Current stable version: {latest_version}")
+        
+        # Force notification for testing if requested
+        if args.force_notify:
+            logger.info("--force-notify flag set, sending notification anyway")
+            if notify_new_version(config, latest_version):
+                logger.info("Test notification sent successfully")
+                sys.exit(0)
+            else:
+                logger.error("Test notification failed")
+                sys.exit(1)
+        
         sys.exit(0)
 
 
